@@ -11,7 +11,7 @@ concurrency:
 
 env:
   KERNEL_REPO: LineageOS/android_kernel_google_redbull
-  CLANG_VERSION: r596125   # Clang 22.0.2 (hardcoded for now)
+  CLANG_VERSION: r596125   # Clang 22.0.2
   CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android17-release/clang-r596125.tar.gz
   MKARGS: ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- LLVM=1 LLVM_IAS=1
 
@@ -35,8 +35,8 @@ jobs:
             susfs: true
             localversion: -resukisu-susfs
     steps:
-      - name: Checkout (manual hooks patch)
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v7
 
       - name: Install packages
         run: |
@@ -47,7 +47,7 @@ jobs:
 
       - name: Cache Clang ${{ env.CLANG_VERSION }}
         id: clang-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/clang
           key: clang-${{ env.CLANG_VERSION }}
@@ -78,43 +78,72 @@ jobs:
       - name: Integrate latest BakaSU
         working-directory: kernel
         run: |
-          curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
-          echo "BAKASU_COMMIT=$(git -C KernelSU rev-parse --short HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
+          curl -fsSL "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" -o /tmp/bakasu-setup.sh
+          bash /tmp/bakasu-setup.sh
+          test -d KernelSU || { echo "::error::BakaSU setup did not create KernelSU/"; exit 1; }
+          echo "BAKASU_COMMIT=$(git -C KernelSU rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
-      - name: Apply manual hooks
-        working-directory: kernel
-        run: |
-          patch -p1 --forward --no-backup-if-mismatch < ../patches/ksu_manual_hooks.patch
-          grep -rn "ksu_handle_fstat64_ret" fs/stat.c
-
-      - name: Apply SUSFS kernel patches
+      - name: Apply SUSFS kernel side (v2.3.0, 4.19 port)
         if: matrix.susfs
         working-directory: kernel
         run: |
-          git clone --depth=1 -b "kernel-$KSERIES" https://gitlab.com/simonpunk/susfs4ksu.git ../susfs
-          echo "SUSFS_COMMIT=$(git -C ../susfs rev-parse --short HEAD)" >> "$GITHUB_ENV"
-          cp ../susfs/kernel_patches/fs/* fs/
-          cp ../susfs/kernel_patches/include/linux/* include/linux/
-          patch -p1 --forward --no-backup-if-mismatch < "../susfs/kernel_patches/50_add_susfs_in_kernel-$KSERIES.patch"
+          # Upstream port is written for another 4.19 tree: apply strictly, then patch the
+          # tree-specific hunks from patches/. Rejects are never tolerated at the end.
+          if ! patch -p1 --forward --fuzz=0 --no-backup-if-mismatch < ../patches/susfs-v2.3.0-4.19.patch; then
+            echo "::notice::upstream SUSFS port has tree-specific rejects; applying redbull adaptations"
+            find . -name '*.rej' -delete
+          fi
+          patch -p1 --forward --fuzz=0 --no-backup-if-mismatch < ../patches/susfs-v2.3.0-4.19-redbull.patch
+          if [ -n "$(find . -name '*.rej' -o -name '*.orig')" ]; then
+            echo "::error::SUSFS patch left rejected hunks"
+            find . -name '*.rej' | while read -r f; do echo "=== $f ==="; cat "$f"; done
+            exit 1
+          fi
+          test -f fs/susfs.c
+          grep -q "susfs_init" fs/susfs.c
+          grep -q "susfs_is_current_proc_no_su" include/linux/susfs_def.h
+          echo "SUSFS_VER=v2.3.0" >> "$GITHUB_ENV"
+
+      - name: Apply manual hooks
+        if: ${{ !matrix.susfs }}
+        working-directory: kernel
+        run: |
+          patch -p1 --forward --fuzz=0 --no-backup-if-mismatch < ../patches/ksu_manual_hooks.patch
+          if [ -n "$(find . -name '*.rej' -o -name '*.orig')" ]; then
+            echo "::error::manual hooks patch left rejected hunks"
+            find . -name '*.rej' | while read -r f; do echo "=== $f ==="; cat "$f"; done
+            exit 1
+          fi
+          grep -rn "ksu_handle_fstat64_ret" fs/stat.c
 
       - name: Configure
         working-directory: kernel
         run: |
           make $MKARGS redbull_defconfig
-          ./scripts/config --enable KSU --enable KSU_MANUAL_HOOK --enable KSU_MULTI_MANAGER_SUPPORT \
+          ./scripts/config --enable KSU --enable KSU_MULTI_MANAGER_SUPPORT \
             --enable KALLSYMS_ALL --enable THINLTO --disable CC_WERROR \
             --disable LOCALVERSION_AUTO --set-str LOCALVERSION "${{ matrix.localversion }}"
           if [ "${{ matrix.susfs }}" = "true" ]; then
-            # manual hooks are in use, so SUS_SU must stay off
-            ./scripts/config --enable KSU_SUSFS --disable KSU_SUSFS_SUS_SU
+            # KSU_SUSFS and KSU_MANUAL_HOOK are one Kconfig choice: SUSFS brings its own hooks
+            ./scripts/config --enable KSU_SUSFS --disable KSU_MANUAL_HOOK \
+              --enable KSU_SUSFS_SUS_PATH --enable KSU_SUSFS_SUS_MOUNT --enable KSU_SUSFS_SUS_KSTAT \
+              --enable KSU_SUSFS_SPOOF_UNAME --enable KSU_SUSFS_ENABLE_LOG \
+              --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+              --enable KSU_SUSFS_OPEN_REDIRECT --enable KSU_SUSFS_SUS_MAP
           else
-            ./scripts/config --disable KSU_SUSFS
+            ./scripts/config --enable KSU_MANUAL_HOOK --disable KSU_SUSFS
           fi
           make $MKARGS olddefconfig
           grep -q '^CONFIG_KSU=y' .config
           if [ "${{ matrix.susfs }}" = "true" ]; then
             grep -q '^CONFIG_KSU_SUSFS=y' .config
+            ! grep -q '^CONFIG_KSU_MANUAL_HOOK=y' .config
+            for f in SUS_PATH SUS_MOUNT SUS_KSTAT SPOOF_UNAME ENABLE_LOG HIDE_KSU_SUSFS_SYMBOLS \
+                     SPOOF_CMDLINE_OR_BOOTCONFIG OPEN_REDIRECT SUS_MAP; do
+              grep -q "^CONFIG_KSU_SUSFS_$f=y" .config || { echo "::error::CONFIG_KSU_SUSFS_$f missing"; exit 1; }
+            done
           else
+            grep -q '^CONFIG_KSU_MANUAL_HOOK=y' .config
             ! grep -q '^CONFIG_KSU_SUSFS=y' .config
           fi
           grep -E '^CONFIG_(KSU|LOCALVERSION)' .config
@@ -130,7 +159,7 @@ jobs:
       - name: Package AnyKernel3 zip
         run: |
           DATE=$(date -u +%Y%m%d)
-          ZIP="BakaSU-redbull-${KREL}-${DATE}.zip"
+          ZIP="redbull-${KREL}-${DATE}.zip"
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
           cp kernel/arch/arm64/boot/Image.lz4 ak3/Image.lz4
           cd ak3
@@ -181,14 +210,14 @@ jobs:
           KBRANCH=$KBRANCH
           KCOMMIT=$KCOMMIT
           BAKASU_COMMIT=$BAKASU_COMMIT
-          SUSFS_COMMIT=${SUSFS_COMMIT:-}
+          SUSFS_VER=${SUSFS_VER:-none}
           BUILD_SECS=$BUILD_SECS
-          BUILT_AT=$(date -u '+%Y-%m-%d %H:%M UTC')
+          BUILT_AT="$(date -u '+%Y-%m-%d %H:%M UTC')"
           META
           sed -i 's/^          //' meta.env
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.variant }}
           path: out/*
@@ -202,7 +231,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dl
 
@@ -215,10 +244,11 @@ jobs:
           cp dl/*/*.zip files/
           (cd files && sha256sum *.zip > SHA256SUMS.txt)
 
+          load() { ( . "dl/$1/meta.env"; echo "$ZIP|$KREL|$KBRANCH|$KCOMMIT|$BAKASU_COMMIT|$SUSFS_VER|$BUILD_SECS|$BUILT_AT" ); }
           fmt() { printf '%dm %02ds' $(( $1 / 60 )) $(( $1 % 60 )); }
-          load() { ( . "dl/$1/meta.env"; echo "$VARIANT|$ZIP|$KREL|$KBRANCH|$KCOMMIT|$BAKASU_COMMIT|$SUSFS_COMMIT|$BUILD_SECS|$BUILT_AT" ); }
-          IFS='|' read -r _ Z1 K1 BR C1 B1 _ T1 W1 <<< "$(load bakasu)"
-          IFS='|' read -r _ Z2 K2 _  _  _  S2 T2 W2 <<< "$(load bakasu-susfs)"
+
+          IFS='|' read -r Z1 K1 BR C1 B1 _ T1 W1 <<< "$(load bakasu)"
+          IFS='|' read -r Z2 K2 _  _  _  S2 T2 W2 <<< "$(load bakasu-susfs)"
 
           cat > body.md << BODY
           Monthly automated kernel build for **Pixel 5 / 5a (redbull: bramble, redfin)** with root via **BakaSU**.
@@ -233,16 +263,15 @@ jobs:
           - Built: $W1 (BakaSU), $W2 (BakaSU + SUSFS)
           - Kernel source: [LineageOS/android_kernel_google_redbull](https://github.com/$KERNEL_REPO) \`$BR\` @ \`$C1\`
           - BakaSU: \`$B1\` (latest \`main\`)
-          - SUSFS: \`$S2\` (simonpunk/susfs4ksu, kernel patches only in the SUSFS variant)
+          - SUSFS: $S2 (kernel side ported to 4.19, patches in \`patches/\`)
           - Compiler: Android Clang 22.0.2 ($CLANG_VERSION), ThinLTO
-          - Hooks: manual hooks (no kprobes)
+          - Hooks: manual hooks for the plain build, SUSFS inline hooks for the SUSFS build
           - Checksums: \`SHA256SUMS.txt\`
 
           ## Install
           Flash the zip from a custom recovery, reboot, then install the BakaSU manager APK.
           Flash only one variant.
           BODY
-          sed -i 's/^          //' body.md
 
           gh release create "$TAG" files/* \
             --repo "${{ github.repository }}" \

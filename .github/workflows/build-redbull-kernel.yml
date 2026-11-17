@@ -1,0 +1,250 @@
+name: Build Redbull Kernel (BakaSU / BakaSU + SUSFS)
+
+on:
+  schedule:
+    - cron: "0 3 1 * *"   # monthly, 1st day 03:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: redbull-kernel
+  cancel-in-progress: false
+
+env:
+  KERNEL_REPO: LineageOS/android_kernel_google_redbull
+  CLANG_VERSION: r596125   # Clang 22.0.2 (hardcoded for now)
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android17-release/clang-r596125.tar.gz
+  MKARGS: ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- LLVM=1 LLVM_IAS=1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build (${{ matrix.variant }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: bakasu
+            susfs: false
+            localversion: -resukisu
+          - variant: bakasu-susfs
+            susfs: true
+            localversion: -resukisu-susfs
+    steps:
+      - name: Checkout (manual hooks patch)
+        uses: actions/checkout@v4
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev dwarves rsync kmod cpio lz4 zip \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Cache Clang ${{ env.CLANG_VERSION }}
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/clang
+          key: clang-${{ env.CLANG_VERSION }}
+
+      - name: Download Clang ${{ env.CLANG_VERSION }}
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/clang
+          curl -fL --retry 5 -o /tmp/clang.tar.gz "$CLANG_URL"
+          tar -xzf /tmp/clang.tar.gz -C ~/clang
+          rm /tmp/clang.tar.gz
+
+      - name: Set up toolchain
+        run: |
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
+          ~/clang/bin/clang --version | head -1
+
+      - name: Clone latest LineageOS kernel (default branch)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH=$(gh api "repos/$KERNEL_REPO" --jq .default_branch)
+          git clone --depth=1 -b "$BRANCH" "https://github.com/$KERNEL_REPO.git" kernel
+          echo "KBRANCH=$BRANCH" >> "$GITHUB_ENV"
+          echo "KCOMMIT=$(git -C kernel rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "KSERIES=$(make -C kernel -s kernelversion | cut -d. -f1,2)" >> "$GITHUB_ENV"
+
+      - name: Integrate latest BakaSU
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
+          echo "BAKASU_COMMIT=$(git -C KernelSU rev-parse --short HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
+
+      - name: Apply manual hooks
+        working-directory: kernel
+        run: |
+          patch -p1 --forward --no-backup-if-mismatch < ../patches/ksu_manual_hooks.patch
+          grep -rn "ksu_handle_fstat64_ret" fs/stat.c
+
+      - name: Apply SUSFS kernel patches
+        if: matrix.susfs
+        working-directory: kernel
+        run: |
+          git clone --depth=1 -b "kernel-$KSERIES" https://gitlab.com/simonpunk/susfs4ksu.git ../susfs
+          echo "SUSFS_COMMIT=$(git -C ../susfs rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          cp ../susfs/kernel_patches/fs/* fs/
+          cp ../susfs/kernel_patches/include/linux/* include/linux/
+          patch -p1 --forward --no-backup-if-mismatch < "../susfs/kernel_patches/50_add_susfs_in_kernel-$KSERIES.patch"
+
+      - name: Configure
+        working-directory: kernel
+        run: |
+          make $MKARGS redbull_defconfig
+          ./scripts/config --enable KSU --enable KSU_MANUAL_HOOK --enable KSU_MULTI_MANAGER_SUPPORT \
+            --enable KALLSYMS_ALL --enable THINLTO --disable CC_WERROR \
+            --disable LOCALVERSION_AUTO --set-str LOCALVERSION "${{ matrix.localversion }}"
+          if [ "${{ matrix.susfs }}" = "true" ]; then
+            # manual hooks are in use, so SUS_SU must stay off
+            ./scripts/config --enable KSU_SUSFS --disable KSU_SUSFS_SUS_SU
+          else
+            ./scripts/config --disable KSU_SUSFS
+          fi
+          make $MKARGS olddefconfig
+          grep -q '^CONFIG_KSU=y' .config
+          if [ "${{ matrix.susfs }}" = "true" ]; then
+            grep -q '^CONFIG_KSU_SUSFS=y' .config
+          else
+            ! grep -q '^CONFIG_KSU_SUSFS=y' .config
+          fi
+          grep -E '^CONFIG_(KSU|LOCALVERSION)' .config
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          START=$(date +%s)
+          make $MKARGS -j"$(nproc)" Image.lz4
+          echo "BUILD_SECS=$(( $(date +%s) - START ))" >> "$GITHUB_ENV"
+          echo "KREL=$(make $MKARGS -s kernelrelease)" >> "$GITHUB_ENV"
+
+      - name: Package AnyKernel3 zip
+        run: |
+          DATE=$(date -u +%Y%m%d)
+          ZIP="BakaSU-redbull-${KREL}-${DATE}.zip"
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          cp kernel/arch/arm64/boot/Image.lz4 ak3/Image.lz4
+          cd ak3
+          cat > anykernel.sh << 'AKEOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+          properties() { '
+          kernel.string=__KSTRING__
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=bramble
+          device.name2=redfin
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+          NO_MAGISK_CHECK=1;
+          . tools/ak3-core.sh
+          split_boot;
+          if [ -f "$SPLITIMG/ramdisk.cpio" ]; then
+            unpack_ramdisk;
+            write_boot;
+          else
+            flash_boot;
+          fi;
+          AKEOF
+          sed -i 's/^          //' anykernel.sh
+          sed -i "s|__KSTRING__|BakaSU ${KREL} (bramble/redfin)|" anykernel.sh
+          rm -rf .git README.md modules patch ramdisk
+          mkdir -p ../out
+          zip -r9 "../out/$ZIP" ./* >/dev/null
+          cd ../out
+          unzip -tq "$ZIP"
+          cat > meta.env << META
+          VARIANT=${{ matrix.variant }}
+          ZIP=$ZIP
+          KREL=$KREL
+          KBRANCH=$KBRANCH
+          KCOMMIT=$KCOMMIT
+          BAKASU_COMMIT=$BAKASU_COMMIT
+          SUSFS_COMMIT=${SUSFS_COMMIT:-}
+          BUILD_SECS=$BUILD_SECS
+          BUILT_AT=$(date -u '+%Y-%m-%d %H:%M UTC')
+          META
+          sed -i 's/^          //' meta.env
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.variant }}
+          path: out/*
+          retention-days: 7
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="redbull-$(date -u +%Y.%m.%d-%H%M)"
+          mkdir -p files
+          cp dl/*/*.zip files/
+          (cd files && sha256sum *.zip > SHA256SUMS.txt)
+
+          fmt() { printf '%dm %02ds' $(( $1 / 60 )) $(( $1 % 60 )); }
+          load() { ( . "dl/$1/meta.env"; echo "$VARIANT|$ZIP|$KREL|$KBRANCH|$KCOMMIT|$BAKASU_COMMIT|$SUSFS_COMMIT|$BUILD_SECS|$BUILT_AT" ); }
+          IFS='|' read -r _ Z1 K1 BR C1 B1 _ T1 W1 <<< "$(load bakasu)"
+          IFS='|' read -r _ Z2 K2 _  _  _  S2 T2 W2 <<< "$(load bakasu-susfs)"
+
+          cat > body.md << BODY
+          Monthly automated kernel build for **Pixel 5 / 5a (redbull: bramble, redfin)** with root via **BakaSU**.
+
+          ## Downloads
+          | Variant | File | Kernel release | Build time |
+          |---|---|---|---|
+          | BakaSU | \`$Z1\` | \`$K1\` | $(fmt "$T1") |
+          | BakaSU + SUSFS | \`$Z2\` | \`$K2\` | $(fmt "$T2") |
+
+          ## Build info
+          - Built: $W1 (BakaSU), $W2 (BakaSU + SUSFS)
+          - Kernel source: [LineageOS/android_kernel_google_redbull](https://github.com/$KERNEL_REPO) \`$BR\` @ \`$C1\`
+          - BakaSU: \`$B1\` (latest \`main\`)
+          - SUSFS: \`$S2\` (simonpunk/susfs4ksu, kernel patches only in the SUSFS variant)
+          - Compiler: Android Clang 22.0.2 ($CLANG_VERSION), ThinLTO
+          - Hooks: manual hooks (no kprobes)
+          - Checksums: \`SHA256SUMS.txt\`
+
+          ## Install
+          Flash the zip from a custom recovery, reboot, then install the BakaSU manager APK.
+          Flash only one variant.
+          BODY
+          sed -i 's/^          //' body.md
+
+          gh release create "$TAG" files/* \
+            --repo "${{ github.repository }}" \
+            --title "Redbull kernel $(date -u +%Y-%m-%d): BakaSU & BakaSU + SUSFS (${K1%%-resukisu*})" \
+            --notes-file body.md --latest

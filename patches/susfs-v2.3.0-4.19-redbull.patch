@@ -1,0 +1,137 @@
+--- a/fs/Makefile	2026-11-17 22:28:35.234395800 +0530
++++ b/fs/Makefile	2026-11-17 22:29:27.370682100 +0530
+@@ -21,6 +21,8 @@
+ obj-y +=	no-block.o
+ endif
+ 
++obj-$(CONFIG_KSU_SUSFS) += susfs.o
++
+ obj-$(CONFIG_PROC_FS) += proc_namespace.o
+ 
+ obj-y				+= notify/
+--- a/fs/namespace.c	2026-11-17 22:28:53.864087800 +0530
++++ b/fs/namespace.c	2026-11-17 22:32:57.532367600 +0530
+@@ -237,8 +237,6 @@
+ 		mnt->mnt_count = 1;
+ 		mnt->mnt_writers = 0;
+ #endif
+-		mnt->mnt.data = NULL;
+-
+ 		INIT_HLIST_NODE(&mnt->mnt_hash);
+ 		INIT_LIST_HEAD(&mnt->mnt_child);
+ 		INIT_LIST_HEAD(&mnt->mnt_mounts);
+@@ -293,8 +291,6 @@
+ 		mnt->mnt_count = 1;
+ 		mnt->mnt_writers = 0;
+ #endif
+-		mnt->mnt.data = NULL;
+-
+ 		INIT_HLIST_NODE(&mnt->mnt_hash);
+ 		INIT_LIST_HEAD(&mnt->mnt_child);
+ 		INIT_LIST_HEAD(&mnt->mnt_mounts);
+@@ -1112,7 +1108,21 @@
+ 	if (!fc->root)
+ 		return ERR_PTR(-EINVAL);
+ 
++#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++	// - We will just stop checking for ksu process if /sdcard/Android is accessible,
++	//   for the sake of performance
++	if (static_branch_unlikely(&susfs_is_sdcard_android_data_not_decrypted)) {
++		if (susfs_is_current_ksu_domain()) {
++			mnt = susfs_alloc_non_unshare_ksu_vfsmnt(fc->source ?: "none");
++			goto bypass_orig_flow;
++		}
++	}
++#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++
+ 	mnt = alloc_vfsmnt(fc->source ?: "none");
++#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
++bypass_orig_flow:
++#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+ 	if (!mnt)
+ 		return ERR_PTR(-ENOMEM);
+ 
+--- a/fs/open.c	2026-11-17 22:28:53.867889500 +0530
++++ b/fs/open.c	2026-11-17 22:29:42.284378800 +0530
+@@ -362,6 +362,9 @@
+ 	struct inode *inode;
+ 	int res;
+ 	unsigned int lookup_flags = LOOKUP_FOLLOW;
++#ifdef CONFIG_KSU_SUSFS
++	struct filename *fname = NULL;
++#endif
+ 
+ 	if (mode & ~S_IRWXO)	/* where's F_OK, X_OK, W_OK, R_OK? */
+ 		return -EINVAL;
+--- a/fs/proc/cmdline.c	2026-11-17 22:28:40.834400600 +0530
++++ b/fs/proc/cmdline.c	2026-11-17 22:29:53.858976600 +0530
+@@ -4,8 +4,20 @@
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
+ 
++#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
++extern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;
++extern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);
++#endif
++
+ static int cmdline_proc_show(struct seq_file *m, void *v)
+ {
++#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
++	if (static_branch_likely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {
++		/* the fake buffer is a full copy of /proc/cmdline, trailing newline included */
++		susfs_spoof_cmdline_or_bootconfig(m);
++		return 0;
++	}
++#endif
+ 	seq_puts(m, saved_command_line);
+ 	seq_putc(m, '\n');
+ 	return 0;
+--- a/fs/proc/task_mmu.c	2026-11-17 22:28:53.873621300 +0530
++++ b/fs/proc/task_mmu.c	2026-11-17 22:29:35.004043300 +0530
+@@ -20,6 +20,9 @@
+ #include <linux/uaccess.h>
+ #include <linux/pkeys.h>
+ #include <linux/mm_inline.h>
++#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
++#include <linux/susfs_def.h>
++#endif // #if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+ 
+ #include <asm/elf.h>
+ #include <asm/tlb.h>
+--- a/fs/proc_namespace.c	2026-11-17 22:28:53.875628800 +0530
++++ b/fs/proc_namespace.c	2026-11-17 22:31:17.086249400 +0530
+@@ -274,9 +274,7 @@
+ 	if (err)
+ 		goto out;
+ 	show_mnt_opts(m, mnt);
+-	if (sb->s_op->show_options2)
+-		err = sb->s_op->show_options2(mnt, m, mnt_path.dentry);
+-	else if (sb->s_op->show_options)
++	if (sb->s_op->show_options)
+ 		err = sb->s_op->show_options(m, mnt_path.dentry);
+ 	seq_puts(m, " 0 0\n");
+ out:
+@@ -341,9 +339,7 @@
+ 	err = show_sb_opts(m, sb);
+ 	if (err)
+ 		goto out;
+-	if (sb->s_op->show_options2) {
+-		err = sb->s_op->show_options2(mnt, m, mnt->mnt_root);
+-	} else if (sb->s_op->show_options)
++	if (sb->s_op->show_options)
+ 		err = sb->s_op->show_options(m, mnt->mnt_root);
+ 	seq_putc(m, '\n');
+ out:
+--- a/kernel/reboot.c	2026-11-17 22:28:53.891327500 +0530
++++ b/kernel/reboot.c	2026-11-17 22:29:31.390281200 +0530
+@@ -297,6 +297,10 @@
+ 
+ DEFINE_MUTEX(system_transition_mutex);
+ 
++#ifdef CONFIG_KSU_SUSFS
++extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
++#endif
++
+ /*
+  * Reboot system call: for obvious reasons only root may call it,
+  * and even root needs to set up some magic numbers in the registers
